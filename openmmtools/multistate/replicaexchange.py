@@ -78,8 +78,10 @@ class ReplicaExchangeSampler(multistate.MultiStateSampler):
         The number of iterations to perform. Both ``float('inf')`` and
         ``numpy.inf`` are accepted for infinity. If you set this to infinity,
         be sure to set also ``online_analysis_interval``.
-    replica_mixing_scheme : 'swap-all', 'swap-neighbors' or None, Default: 'swap-all'
-        The scheme used to swap thermodynamic states between replicas.
+    replica_mixing_scheme : 'swap-all', 'swap-neighbors', 'swap-neighbors-DEO' or None, Default: 'swap-all'
+        The scheme used to swap thermodynamic states between replicas;
+        'swap-neighbors' is equivalent to the 'SEO' scheme given in https://arxiv.org/pdf/1905.02939.pdf;
+        'swap-neighbors-DEO' uses the 'deterministic' swap scheme.
     online_analysis_interval : None or Int >= 1, optional, default None
         Choose the interval at which to perform online analysis of the free energy.
 
@@ -109,6 +111,7 @@ class ReplicaExchangeSampler(multistate.MultiStateSampler):
     sampler_states
     metadata
     is_completed
+    _cycle_counter
 
     Examples
     --------
@@ -205,6 +208,8 @@ class ReplicaExchangeSampler(multistate.MultiStateSampler):
 
     :param online_analysis_minimum_iterations: Minimum number of iterations needed before online analysis is run as int
 
+    :param _cycle_counter: online counter of the cycle number (only used with )
+
     """
 
     # -------------------------------------------------------------------------
@@ -216,12 +221,13 @@ class ReplicaExchangeSampler(multistate.MultiStateSampler):
         # Initialize multi-state sampler simulation.
         super(ReplicaExchangeSampler, self).__init__(**kwargs)
         self.replica_mixing_scheme = replica_mixing_scheme
+        self._cycle_counter = 0
 
     class _StoredProperty(multistate.MultiStateSampler._StoredProperty):
 
         @staticmethod
         def _repex_mixing_scheme_validator(instance, replica_mixing_scheme):
-            supported_schemes = ['swap-all', 'swap-neighbors', None]
+            supported_schemes = ['swap-all', 'swap-neighbors', 'swap-neighbors-DEO', None]
             if replica_mixing_scheme not in supported_schemes:
                 raise ValueError("Unknown replica mixing scheme '{}'. Supported values "
                                  "are {}.".format(replica_mixing_scheme, supported_schemes))
@@ -263,8 +269,9 @@ class ReplicaExchangeSampler(multistate.MultiStateSampler):
 
         # Perform swap attempts according to requested scheme.
         with utils.time_it('Mixing of replicas'):
-            if self.replica_mixing_scheme == 'swap-neighbors':
+            if self.replica_mixing_scheme in ['swap-neighbors', 'swap-neighbors-DEO']:
                 self._mix_neighboring_replicas()
+                self._cycle_counter += 1 # update the cycle counter (only necessary for 'DEO')
             elif self.replica_mixing_scheme == 'swap-all':
                 nswap_attempts = self.n_replicas**3
                 # Try to use numba-accelerated mixing code if possible,
@@ -369,16 +376,21 @@ class ReplicaExchangeSampler(multistate.MultiStateSampler):
 
         # TODO: Extend this to allow more remote swaps or more thorough mixing if locality > 1.
 
-        # Attempt swaps of pairs of replicas using traditional scheme (e.g. [0,1], [2,3], ...).
-        offset = np.random.randint(2)  # Offset is 0 or 1.
-        for thermodynamic_state_i in range(offset, self.n_replicas-1, 2):
+        if self.replica_mixing_scheme == 'swap-neighbors-DEO':
+            even_cycle = self._cycle_counter % 2 == 0
+            offset = 0 if even_cycle else 1
+        else: # Attempt swaps of pairs of replicas using traditional scheme (e.g. [0,1], [2,3], ...).
+            offset = np.random.randint(2)  # Offset is 0 or 1.
+
+        thermodynamic_states_i = range(offset, self.n_replicas-1, 2)
+        for thermodynamic_state_i in thermodynamic_states_i:
             thermodynamic_state_j = thermodynamic_state_i + 1  # Neighboring state.
 
             # Determine which replicas currently hold the thermodynamic states.
             replica_i = np.where(self._replica_thermodynamic_states == thermodynamic_state_i)
             replica_j = np.where(self._replica_thermodynamic_states == thermodynamic_state_j)
             self._attempt_swap(replica_i, replica_j)
-
+        
     def _attempt_swap(self, replica_i, replica_j):
         """Attempt a single exchange between two replicas."""
         # Determine the thermodynamic states associated to these replicas.
